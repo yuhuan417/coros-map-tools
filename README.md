@@ -69,6 +69,7 @@ go install github.com/protomaps/go-pmtiles@latest
 |---|---|---|
 | **COROS 的 CDN**<br>`map-oss-cn.coros.com`<br>`osm-map.s3.us-west-1.amazonaws.com` | `download`、App 链接 | 地图数据本体。无鉴权、无文档、无 SLA，URL 布局是抓官方页面 JS 逆出来的，**随时可能变**；变了你就会看到 404/403（`download` 会直接报错退出） |
 | **阿里 DataV.GeoAtlas**<br>`geo.datav.aliyun.com/areas_v3/bound/` | `boundary` | 行政区划**边界**（不是地图数据）。第三方服务，同样无 SLA。取不到时换源即可，见下 |
+| **OSM Nominatim**<br>`nominatim.openstreetmap.org` | `boundary --place` | 中国之外的「地名 → 边界」。使用政策要求每秒 ≤1 次请求并带可识别 UA，工具已内置 1.1 秒间隔与 UA。重活请换下面的离线数据源 |
 | **go-pmtiles** | `extract` | 官方 PMTiles 工具，按边界做实际的裁剪计算。默认在 PATH 里找，可用 `COROS_PMTILES` 或 `--pmtiles-bin` 指定 |
 
 关键区别：**地图数据只来自 COROS，行政边界只来自 DataV，两者互不绑定。**
@@ -102,7 +103,7 @@ DataV 支持按层级逐级取，所以不用背代码——`100000_full.json` �
 |---|---|
 | `list` | 列出中国区 v5 区域包、大小、包含省份、App 链接用的 map_id；`--world` 列出中国之外的 14 个区域 |
 | `download <区域>` | 下载整包，支持断点续传；`--check` 校验条目数/总大小/CRC；中国之外加 `--world --layer landscape\|topo` |
-| `boundary <adcode...>` | 按 adcode 取行政边界并合并成 GeoJSON（默认阿里 DataV，可换源） |
+| `boundary <adcode...>` | 取行政边界并合并成 GeoJSON：中国用 adcode（阿里 DataV），中国之外用 `--place 地名`（OSM Nominatim） |
 | `tiles <包...>` | 列出包里与边界相交的瓦片（可直接读 zip，无需解压） |
 | `info <文件>` | 查看 PMTiles 头部（zoom 范围、bbox、压缩方式） |
 | `extract --src <包...> --region <geojson>` | 按边界裁剪，输出 `Map/<图层>/<前缀>/<文件名>` |
@@ -269,8 +270,20 @@ python3 coros_map.py extract \
 
 几点要注意：
 
-- **中国之外没有现成的行政区划边界数据源**（`boundary` 用的阿里 DataV 只覆盖中国）。
-  用 `--bbox` 框选，或自己准备 GeoJSON 交给 `--region`（`--url-template` 也可指向任意边界源）。
+- **边界数据**：中国之外可以用 OSM 地名直接取边界，工具会把候选连同范围列出来供你选：
+
+  ```bash
+  python3 coros_map.py boundary --place "Chamonix, France" -o chamonix.json
+  #   [0] Chamonix-Mont-Blanc, ...  (administrative, 范围 0.19°×0.13°)
+  #   → 采用 [0] ...
+  python3 coros_map.py boundary --place "San José, Costa Rica" -o sj.json --pick 2   # 同名多地时按范围挑
+  ```
+
+  也可以 `--bbox` 直接框，或把任意来源的 GeoJSON 交给 `--region`。其他地方性/离线数据源：
+  [geoBoundaries](https://www.geoboundaries.org/)（全球 ADM0-2，CC-BY）、
+  [GADM](https://gadm.org/)（各国分级边界）、
+  Natural Earth（国家级，公有领域）、
+  OSM 的 Overpass API（`boundary=administrative` 关系，最细但要多写点查询）。
 - **区域粒度很粗**（europe 7.9 GB、asia 13.7 GB、north-america 6.5 GB），但这正是本工具的用途：
   裁完只留你要的那一小块。
 - **顶层目录名不同**：中国区包是 `Map/`，全球区包是 `map/`。工具按源包原样保留；

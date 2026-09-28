@@ -31,7 +31,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -96,6 +98,10 @@ WORLD_V5_PATH = "/regionMap/v5"
 WORLD_V5_INDEX = "/regionMap/v5/regions_v5.json"
 # 行政边界来源（阿里 DataV.GeoAtlas）
 DATAV_URL = "https://geo.datav.aliyun.com/areas_v3/bound/{adcode}{suffix}.json"
+# 中国之外的边界来源：OSM Nominatim 地理编码（返回 GeoJSON 多边形）
+# 使用政策：每秒最多 1 次请求、必须带可识别的 User-Agent，个人自用即可
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+USER_AGENT = f"coros-map-tools/{__version__} (+https://github.com/yuhuan417/coros-map-tools)"
 
 
 def human(n):
@@ -303,7 +309,9 @@ def iter_package_tiles(src, styles=("VCM", "VSM")):
 # ------------------------------------------------------------------ 网络工具
 
 def http_open(url, headers=None, timeout=30):
-    req = urllib.request.Request(url, headers=headers or {})
+    h = {"User-Agent": USER_AGENT}
+    h.update(headers or {})
+    req = urllib.request.Request(url, headers=h)
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -496,9 +504,36 @@ def cmd_download(args):
         print(f"  CRC 校验：{'通过 ✅' if bad is None else f'失败 ❌ ({bad})'}")
 
 
+def nominatim_lookup(query, limit=5, threshold=0.0002, pick=0):
+    """用 OSM Nominatim 按地名取 GeoJSON 边界（中国之外）"""
+    params = {"q": query, "format": "geojson", "polygon_geojson": 1,
+              "limit": limit, "polygon_threshold": threshold}
+    url = NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
+    with http_open(url, timeout=30) as r:
+        d = json.load(r)
+    feats = [f for f in (d.get("features") or []) if feature_polygons(f)]
+    if not feats:
+        raise SystemExit(f"Nominatim 找不到 {query!r}（换个说法，或直接用 --bbox）")
+    for i, f in enumerate(feats):
+        name = f["properties"].get("display_name", "")
+        b = features_bbox([f])
+        span = f"{b[2] - b[0]:.2f}°×{b[3] - b[1]:.2f}°"
+        eprint(f"  [{i}] {name}  ({f['properties'].get('type', '')}, 范围 {span})")
+    if not 0 <= pick < len(feats):
+        raise SystemExit(f"--pick {pick} 超范围（只有 {len(feats)} 个候选）")
+    chosen = feats[pick]
+    eprint(f"  → 采用 [{pick}] {chosen['properties'].get('display_name', '')}")
+    return [chosen]
+
+
 def cmd_boundary(args):
     feats = []
-    for code in args.adcodes:
+    if args.place:
+        for i, q in enumerate(args.place):
+            if i:
+                time.sleep(1.1)                 # Nominatim 限速：每秒 1 次
+            feats.extend(nominatim_lookup(q, args.limit, args.polygon_threshold, args.pick))
+    for code in ([] if args.place else args.adcodes):
         last_err = None
         suffixes = ("",) if (args.no_full or args.url_template) else ("_full", "")
         for suffix in suffixes:
@@ -754,8 +789,14 @@ def main():
     p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=cmd_download)
 
-    p = sub.add_parser("boundary", help="按 adcode 取行政边界并合并成 GeoJSON（默认源：阿里 DataV）")
-    p.add_argument("adcodes", nargs="+", help="GB/T 2260 行政区划代码，如 110000 310000（北京、上海）")
+    p = sub.add_parser("boundary", help="取行政边界并合并成 GeoJSON（中国用 adcode，中国之外用 --place）")
+    p.add_argument("adcodes", nargs="*", help="GB/T 2260 行政区划代码，如 110000 310000（北京、上海）")
+    p.add_argument("--place", nargs="+", metavar="地名",
+                   help="按地名取边界（走 OSM Nominatim），如 --place 'Paris, France' 'Chamonix, France'")
+    p.add_argument("--pick", type=int, default=0, help="同名多个候选时选第几个（默认 0，会把候选列出来）")
+    p.add_argument("--limit", type=int, default=5, help="候选数量上限")
+    p.add_argument("--polygon-threshold", type=float, default=0.0002,
+                   help="多边形简化阈值，越大顶点越少（默认 0.0002）")
     p.add_argument("-o", "--out", default="region.json")
     p.add_argument("--url-template", metavar="URL",
                    help="改用别的边界数据源，用 {adcode} 占位，例如 "
@@ -803,6 +844,8 @@ def main():
     p.set_defaults(func=cmd_verify)
 
     args = ap.parse_args()
+    if getattr(args, "func", None) is cmd_boundary and not (args.adcodes or args.place):
+        ap.error("需要给 adcode（中国）或 --place（中国之外）")
     if getattr(args, "func", None) in (cmd_tiles, cmd_extract, cmd_verify) and not (
             getattr(args, "region", None) or getattr(args, "bbox", None)):
         ap.error("需要 --region 或 --bbox")
