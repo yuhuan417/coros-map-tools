@@ -90,6 +90,10 @@ CHINA_V5 = {
 LAYERS = {"VCM": "C", "VSM": "S"}
 # 全球 v3 清单（v3/v4 机型用，按 zip 分发）
 GLOBAL_V3_INDEX = US_HOST + "/regionMap/v3/regions_v3.json"
+# 全球（中国之外）v5 区域清单与整包：/regionMap/v5/<区域>_<landscape|topo>_<版本>.zip
+# 注意路径是 regionMap 而不是中国区的 map/region，两套并存
+WORLD_V5_PATH = "/regionMap/v5"
+WORLD_V5_INDEX = "/regionMap/v5/regions_v5.json"
 # 行政边界来源（阿里 DataV.GeoAtlas）
 DATAV_URL = "https://geo.datav.aliyun.com/areas_v3/bound/{adcode}{suffix}.json"
 
@@ -224,6 +228,31 @@ def read_pmtiles_header(path_or_obj):
 _zip_cache = {}          # zip 路径 → ZipFile，避免惰性 opener 用到已关闭的归档
 
 
+def output_tile_path(out_dir, style, qk, name):
+    """输出包里的瓦片路径（中国区顶层是 Map，中国之外是 map）"""
+    for root in ("Map", "map"):
+        p = os.path.join(out_dir, root, style, qk[:3], name)
+        if os.path.exists(p):
+            return p
+    return os.path.join(out_dir, "Map", style, qk[:3], name)
+
+
+def package_root_name(src):
+    """包内顶层目录名：中国区是 Map，中国之外是 map（手表按官方包的原样识别）"""
+    if zipfile.is_zipfile(src):
+        zf = _zip_cache.setdefault(os.path.abspath(src), zipfile.ZipFile(src))
+        for n in zf.namelist():
+            parts = n.split("/")
+            if parts[-1].endswith(".t") and len(parts) >= 3:
+                return parts[0]
+        return "Map"
+    for style in ("VCM", "VSM"):
+        for cand in (os.path.join(src, style), os.path.join(src, "Map", style), os.path.join(src, "map", style)):
+            if os.path.isdir(cand):
+                return os.path.basename(os.path.dirname(cand)) or "Map"
+    return "Map"
+
+
 def iter_package_tiles(src, styles=("VCM", "VSM")):
     """遍历一个地图包，产出 (style, 文件名, quadkey, 大小, 头部信息, 打开函数)
 
@@ -344,6 +373,24 @@ def find_pmtiles_bin(explicit=None):
 # --------------------------------------------------------------------- 子命令
 
 def cmd_list(args):
+    if args.world:
+        regions = fetch_world_regions(CN_HOST if args.host == "cn" else US_HOST)
+        names = [k for k in regions if not k.startswith("_")]
+        if args.region:
+            names = [n for n in names if args.region.lower() in n.lower()]
+        if not names:
+            raise SystemExit("没有匹配的区域")
+        print(f"全球区域包（v5，bundle {regions['_bundleVersion']}，合计 {human(regions['_totalSize'])}）")
+        print(f"{'区域':<22}{'地貌 landscape':>18}{'等高线 topo':>18}")
+        for n in sorted(names):
+            cells = []
+            for t in ("landscape", "topo"):
+                d = regions[n].get(t)
+                cells.append(human(d["size"]) if d else "—")
+            print(f"{n:<22}{cells[0]:>18}{cells[1]:>18}")
+        print(f"\n下载：python3 {os.path.basename(sys.argv[0])} download <区域> --world --layer landscape|topo")
+        print("注意：中国之外的区域包 landscape 与 topo 是分开的，没有合并包")
+        return
     rows = []
     for name, info in CHINA_V5.items():
         if args.region and args.region.lower() not in name.lower():
@@ -368,9 +415,57 @@ def cmd_list(args):
     print(f"\n全球 v3 清单（老机型 zip 分发）：{GLOBAL_V3_INDEX}")
 
 
+def fetch_world_regions(host=US_HOST):
+    """取全球 v5 区域清单 → {区域: {landscape|topo: {size, link}}}，另附 _bundleVersion"""
+    with http_open(host + WORLD_V5_INDEX, timeout=30) as r:
+        d = json.load(r)
+    out = {"_bundleVersion": d.get("bundleVersion", ""), "_totalSize": d.get("totalSize", 0)}
+    for e in (d.get("mapData") or d.get("regions") or []):
+        out.setdefault(e["region"], {})[e["type"]] = e["data"]
+    return out
+
+
+def download_world(args):
+    """中国之外的区域包（landscape = 仅地貌，topo = 仅等高线，没有合并包）"""
+    if args.layer == "OSM":
+        args.layer = "landscape"
+    if args.layer == "ALL":
+        raise SystemExit("中国之外的区域包不提供「地貌+等高线」合并包，请分别指定 "
+                         "--layer landscape 或 --layer topo")
+    if args.layer not in ("landscape", "topo"):
+        raise SystemExit("--layer 只能是 landscape 或 topo")
+    host = CN_HOST if args.host == "cn" else US_HOST
+    regions = fetch_world_regions(host)
+    if args.region not in regions:
+        raise SystemExit(f"未知区域 {args.region}，可用：{', '.join(k for k in regions if not k.startswith('_'))}")
+    if args.layer not in regions[args.region]:
+        raise SystemExit(f"{args.region} 没有 {args.layer}，可用：{', '.join(regions[args.region])}")
+    spec = regions[args.region][args.layer]
+    fn = spec["link"].rsplit("/", 1)[-1]
+    url = host + spec["link"]
+    dest = os.path.join(args.out, fn)
+    os.makedirs(args.out, exist_ok=True)
+    eprint(f"  {url}   (版本 {regions['_bundleVersion']})")
+    n = download(url, dest, resume=not args.no_resume, quiet=args.quiet)
+    if n < 1024:
+        os.path.exists(dest) and os.remove(dest)
+        raise SystemExit(f"下载结果只有 {n} 字节，几乎肯定是空占位文件")
+    print(f"✔ {dest}  {human(n)}")
+    if args.check:
+        with zipfile.ZipFile(dest) as zf:
+            members = [i for i in zf.infolist() if not i.is_dir()]
+            total = sum(i.file_size for i in members)
+            tops = sorted({i.filename.split("/")[0] for i in members})
+            styles = sorted({i.filename.split("/")[1] for i in members if i.filename.count("/") >= 2})
+            bad = zf.testzip()
+        print(f"  条目 {len(members)} 个，解压后合计 {human(total)}，顶层 {tops}，图层 {styles}")
+        print(f"  清单声明 {human(spec['size'])} → {'一致 ✅' if total == spec['size'] else '不一致 ⚠️'}")
+        print(f"  CRC 校验：{'通过 ✅' if bad is None else f'失败 ❌ ({bad})'}")
+
+
 def cmd_download(args):
-    if args.region not in CHINA_V5:
-        raise SystemExit(f"未知区域 {args.region}，可用：{', '.join(CHINA_V5)}")
+    if args.world or args.region not in CHINA_V5:
+        return download_world(args)
     spec = CHINA_V5[args.region][args.layer]
     version = args.version or 5
     if args.host == "s3":
@@ -502,6 +597,7 @@ def cmd_extract(args):
     fboxes = [(f, features_bbox([f])) for f in feats]
     total_out = total_src = 0
     made = []
+    roots = set()
     seen = set()
     for src in args.src:
         for style, name, qk, size, info, opener in iter_package_tiles(src, tuple(args.style)):
@@ -523,7 +619,7 @@ def cmd_extract(args):
             with open(tmp_src, "wb") as f, opener() as r:
                 shutil.copyfileobj(r, f)
             src_path = tmp_src
-            dst_file = os.path.join(args.out, "Map", style, qk[:3], name)
+            dst_file = os.path.join(args.out, package_root_name(src), style, qk[:3], name)
             os.makedirs(os.path.dirname(dst_file), exist_ok=True)
             if args.dry_run:
                 print(f"  [dry-run] {name} ← region {len(sel)} 个多边形")
@@ -532,6 +628,7 @@ def cmd_extract(args):
                 out_size = os.path.getsize(dst_file)
                 total_out += out_size
                 total_src += size
+                roots.add(package_root_name(src))
                 made.append((name, style, out_size, size))
                 print(f"  {name:<20}{style:<5}{human(size):>10} → {human(out_size):>10}  ({out_size * 100 // max(size, 1)}%)")
             os.unlink(region_file)
@@ -540,7 +637,8 @@ def cmd_extract(args):
     if made:
         print(f"\n合计 {len(made)} 个文件：{human(total_src)} → {human(total_out)}"
               f"（压到 {total_out * 100 // max(total_src, 1)}%）")
-        print(f"输出目录：{args.out}/Map  解压后整个 Map 目录拷到手表根目录即可")
+        top = "/".join(sorted(roots)) if roots else "Map"
+        print(f"输出目录：{args.out}/{top}  把这里的顶层目录整个拷到手表根目录即可")
 
 
 def cmd_verify(args):
@@ -594,7 +692,7 @@ def cmd_verify(args):
             qk = lonlat_to_quadkey(lon, lat, 7)
             x, y = lonlat_to_tile(lon, lat, z)
             for style in args.style:
-                out_p = os.path.join(args.out, "Map", style, qk[:3], f"{LAYERS[style]}{qk}V00.t")
+                out_p = output_tile_path(args.out, style, qk, f"{LAYERS[style]}{qk}V00.t")
                 n = sample(out_p, x, y)
                 if n > 0:
                     g_ok += 1
@@ -638,13 +736,18 @@ def main():
     p.add_argument("--region", help="按区域名过滤")
     p.add_argument("--province", help="按省份过滤，如 安徽")
     p.add_argument("--show-ids", action="store_true", help="同时打印 map_id")
+    p.add_argument("--world", action="store_true", help="列出中国之外的全球区域包（v5）")
+    p.add_argument("--host", choices=("cn", "us"), default="us", help="取哪台节点的清单")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("download", help="下载区域整包 zip")
     p.add_argument("region", help="区域名，如 North-China")
     p.add_argument("-o", "--out", default=".", help="保存目录")
-    p.add_argument("--layer", choices=("ALL", "OSM"), default="ALL", help="ALL=地貌+等高线，OSM=仅地貌")
-    p.add_argument("--host", choices=("cn", "s3"), default="cn", help="cn=国内 OSS（有 v5），s3=us-west-1（只有 v3/v4）")
+    p.add_argument("--layer", choices=("ALL", "OSM", "landscape", "topo"), default="ALL",
+                   help="中国区：ALL=地貌+等高线 / OSM=仅地貌；全球区：landscape / topo")
+    p.add_argument("--host", choices=("cn", "us", "s3"), default="cn",
+                   help="cn=国内 OSS，us=全球节点，s3=us-west-1（只有中国区 v3/v4）")
+    p.add_argument("--world", action="store_true", help="下载中国之外的区域包")
     p.add_argument("--version", type=int, choices=(3, 4, 5), help="包版本，默认 cn→5 / s3→4")
     p.add_argument("--no-resume", action="store_true", help="不续传，重新下载")
     p.add_argument("--check", action="store_true", help="校验 zip 条目数/总大小/CRC（1.6 GB 约 6 秒）")

@@ -100,8 +100,8 @@ DataV 支持按层级逐级取，所以不用背代码——`100000_full.json` �
 
 | 命令 | 作用 |
 |---|---|
-| `list` | 列出中国区 v5 区域包、大小、包含省份、App 链接用的 map_id |
-| `download <区域>` | 下载整包，支持断点续传；`--check` 校验条目数/总大小/CRC |
+| `list` | 列出中国区 v5 区域包、大小、包含省份、App 链接用的 map_id；`--world` 列出中国之外的 14 个区域 |
+| `download <区域>` | 下载整包，支持断点续传；`--check` 校验条目数/总大小/CRC；中国之外加 `--world --layer landscape\|topo` |
 | `boundary <adcode...>` | 按 adcode 取行政边界并合并成 GeoJSON（默认阿里 DataV，可换源） |
 | `tiles <包...>` | 列出包里与边界相交的瓦片（可直接读 zip，无需解压） |
 | `info <文件>` | 查看 PMTiles 头部（zoom 范围、bbox、压缩方式） |
@@ -244,35 +244,41 @@ python3 coros_map.py extract --src ~/maps/map_China_ALL_v5.zip --region cities.j
   （`--no-per-tile-region` 可关），让每个文件的 bbox 如实描述自己——万一固件是按
   bbox 匹配文件，也不会打开错文件。
 
-## 中国之外（世界包）：目前拿不到可裁剪的数据
+## 中国之外（世界包）
 
-结论先说：**本工具只支持中国区**。不是格式问题，是数据拿不到，而且和你手表的固件代次强相关。
-
-官方地图分三代，各代的分发方式不同（`mapVersion` 见官方下载页的设备表：APEX 4 / PACE 4 /
-Nomad → `v5`，Pace Pro → `v5`/`v4`，Dura / VERTIX 2s / APEX 2 Pro → `v4`，老固件 APEX 2 Pro → `v3`）：
-
-| 代次 | 格式 | 中国区 | 中国之外 |
-|---|---|---|---|
-| v3 | Garmin IMG（`.csm`，魔数 `DSKIMG`） | — | ✅ 整包 zip：`static.coros.com/mapdown/files/v3/<Region>_<landscape\|topo>.zip`（14 个区域，从 Antarctica 到 Europe 都在） |
-| v4 | Garmin IMG（`.csm`） | ✅ 整包 zip（`osm-map.s3.us-west-1.amazonaws.com/map/region/v4/`） | ❌ 只有 map_id 瓦片包，无整包 |
-| v5 | PMTiles（`.t`） | ✅ 整包 zip（`map-oss-cn.coros.com/map/region/v5/`） | ❌ 只有 map_id 瓦片包，无整包 |
-
-也就是说：**只有中国区提供了「整包 zip」这种可以离线裁剪的分发方式**。中国之外（欧洲、
-北美、东南亚……）官方走的是「瓦片包」路线——页面只给你一个清单链接，例如欧洲是
+**支持。** 全球区域同样提供 v5 整包 zip，里面也是 PMTiles（`map/VSM`、`map/VCM`），
+只是 URL 前缀与中国区不同（`regionMap` 而非 `map/region`），而且 landscape（地貌）与 topo（等高线）
+是**两个分开的包，没有合并包**：
 
 ```
-https://map-oss-us.coros.com/mapid/d1rSYj2M.json#map     # 984 个瓦片 / 8.5 GB
+https://map-oss-{cn,us}.coros.com/regionMap/v5/<区域>_<landscape|topo>_<版本>.zip
+清单：https://map-oss-us.coros.com/regionMap/v5/regions_v5.json
 ```
 
-手表连 WiFi 后由 App 逐个把 `.t` 拉下来。而**这些瓦片文件匿名下载不到**：`mapid/<id>/<文件名>`
-及另外 8 种路径组合全部 404（中国区的 v5 瓦片同样如此，中国是因为有整包 zip 才绕过去了）。
+```bash
+python3 coros_map.py list --world                                            # 14 个区域
+python3 coros_map.py download europe --world --layer landscape -o ~/maps --check
+python3 coros_map.py download europe --world --layer topo      -o ~/maps --check
+# 中国之外没有 DataV 那样的行政边界源，用 --bbox 框选（或自己准备 GeoJSON 给 --region）
+python3 coros_map.py extract \
+    --src ~/maps/europe_landscape_5.0.3.zip ~/maps/europe_topo_5.0.3.zip \
+    --bbox=2.20,48.78,2.47,48.92 --out paris
+```
 
-所以对中国之外的区域，目前只有一条路：把手表连上 WiFi，把这个链接粘进 COROS App →
-设备详情 → 文件下载，**整区域下**（欧洲 8.5 GB、Global 34 GB），没法在电脑上裁完再拷。
+实测：中美洲两包（265.7 MB + 268.5 MB）裁圣何塞周边 → **3.3 MB**（`map/VSM` + `map/VCM` 各一个文件）。
 
-如果哪天能从 App 抓到瓦片的真实下载地址（很可能带签名或走别的 path），本工具可以再加一个
-「按清单逐瓦片下载 → 本地打包成 PMTiles」的模式——解析清单、quadkey、裁剪的管线都是现成的。
+几点要注意：
 
+- **中国之外没有现成的行政区划边界数据源**（`boundary` 用的阿里 DataV 只覆盖中国）。
+  用 `--bbox` 框选，或自己准备 GeoJSON 交给 `--region`（`--url-template` 也可指向任意边界源）。
+- **区域粒度很粗**（europe 7.9 GB、asia 13.7 GB、north-america 6.5 GB），但这正是本工具的用途：
+  裁完只留你要的那一小块。
+- **顶层目录名不同**：中国区包是 `Map/`，全球区包是 `map/`。工具按源包原样保留；
+  手表文件系统大小写不敏感，两者都能识别。
+- **版本号会变**（当前 `5.0.3`）：工具从 `regions_v5.json` 实时读链接，不写死文件名。
+- 另有更老的 v3 全球整包（`static.coros.com/mapdown/files/v3/<Region>_<landscape|topo>.zip`），
+  格式是 Garmin IMG（`.csm`，魔数 `DSKIMG`）——**不是 PMTiles，本工具裁不了**，也不是 v5 机型用的格式。
+- 中国之外的节点：清单和包在 `map-oss-us` 与 `map-oss-cn` 上都有，国内下载加 `--host cn`。
 ## 注意事项
 
 - 输出目录的用法：解压/生成后把**整个 `Map` 目录**合并进手表根目录的 `Map`
