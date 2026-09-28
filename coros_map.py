@@ -298,6 +298,8 @@ def download(url, dest, resume=True, quiet=False):
     total = int(resp.headers.get("Content-Length") or 0) + pos
     mode = "ab" if pos else "wb"
     got = pos
+    tty = sys.stderr.isatty()
+    mark = -1
     with open(dest, mode) as f:
         while True:
             chunk = resp.read(1 << 20)
@@ -305,11 +307,19 @@ def download(url, dest, resume=True, quiet=False):
                 break
             f.write(chunk)
             got += len(chunk)
-            if not quiet:
+            if quiet:
+                continue
+            if tty:                     # 终端里原地刷新一行
                 pct = f"{got * 100 // total}%" if total else "?"
                 sys.stderr.write(f"\r  下载中 {human(got)} / {human(total)} ({pct})   ")
                 sys.stderr.flush()
-    if not quiet:
+            elif total:
+                # 重定向到文件时不要每 1 MB 刷一行，只在每 10% 打一次
+                m = got * 10 // total
+                if m != mark:
+                    mark = m
+                    eprint(f"  下载中 {m * 10}%（{human(got)} / {human(total)}）")
+    if not quiet and tty:
         sys.stderr.write("\r" + " " * 60 + "\r")
     return got
 
