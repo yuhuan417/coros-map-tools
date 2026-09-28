@@ -390,14 +390,22 @@ def cmd_boundary(args):
     feats = []
     for code in args.adcodes:
         last_err = None
-        for suffix in ("_full", ""):
-            url = DATAV_URL.format(adcode=code, suffix=suffix)
+        suffixes = ("",) if (args.no_full or args.url_template) else ("_full", "")
+        for suffix in suffixes:
+            if args.url_template:
+                url = args.url_template.format(adcode=code)
+            else:
+                url = DATAV_URL.format(adcode=code, suffix=suffix)
             try:
-                with http_open(url, timeout=30) as r:
-                    d = json.load(r)
+                if "://" in url:                    # 网络源
+                    with http_open(url, timeout=30) as r:
+                        d = json.load(r)
+                else:                               # 本地文件
+                    with open(url, encoding="utf-8") as r:
+                        d = json.load(r)
                 if d.get("features"):
                     feats.extend(d["features"])
-                    eprint(f"  {code}{suffix}: {len(d['features'])} 个多边形")
+                    eprint(f"  {code}{suffix}: {len(d['features'])} 个多边形  ← {url}")
                     break
             except Exception as e:                              # noqa: BLE001
                 last_err = e
@@ -628,9 +636,14 @@ def main():
     p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=cmd_download)
 
-    p = sub.add_parser("boundary", help="按 adcode 取行政边界并合并成 GeoJSON")
-    p.add_argument("adcodes", nargs="+", help="如 110000 310000（北京、上海）")
+    p = sub.add_parser("boundary", help="按 adcode 取行政边界并合并成 GeoJSON（默认源：阿里 DataV）")
+    p.add_argument("adcodes", nargs="+", help="GB/T 2260 行政区划代码，如 110000 310000（北京、上海）")
     p.add_argument("-o", "--out", default="region.json")
+    p.add_argument("--url-template", metavar="URL",
+                   help="改用别的边界数据源，用 {adcode} 占位，例如 "
+                        "'https://example.com/bound/{adcode}.json'；也可以传本地文件路径")
+    p.add_argument("--no-full", action="store_true",
+                   help="只用 {adcode}.json 单圈边界，不试带下级区县的 {adcode}_full.json")
     p.set_defaults(func=cmd_boundary)
 
     p = sub.add_parser("tiles", help="列出地图包里与边界相交的瓦片")

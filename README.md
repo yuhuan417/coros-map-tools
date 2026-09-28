@@ -58,13 +58,48 @@ go install github.com/protomaps/go-pmtiles@latest
 # 若不在 PATH 里：export COROS_PMTILES=$(go env GOPATH)/bin/go-pmtiles
 ```
 
+## 外部依赖与数据来源
+
+工具本身只用 Python 标准库，但**三样东西来自外部**，用之前先知道自己在依赖谁：
+
+| 依赖 | 用在哪 | 说明 / 风险 |
+|---|---|---|
+| **COROS 的 CDN**<br>`map-oss-cn.coros.com`<br>`osm-map.s3.us-west-1.amazonaws.com` | `download`、App 链接 | 地图数据本体。无鉴权、无文档、无 SLA，URL 布局是抓官方页面 JS 逆出来的，**随时可能变**；变了你就会看到 404/403（`download` 会直接报错退出） |
+| **阿里 DataV.GeoAtlas**<br>`geo.datav.aliyun.com/areas_v3/bound/` | `boundary` | 行政区划**边界**（不是地图数据）。第三方服务，同样无 SLA。取不到时换源即可，见下 |
+| **go-pmtiles** | `extract` | 官方 PMTiles 工具，按边界做实际的裁剪计算。默认在 PATH 里找，可用 `COROS_PMTILES` 或 `--pmtiles-bin` 指定 |
+
+关键区别：**地图数据只来自 COROS，行政边界只来自 DataV，两者互不绑定。**
+`extract` 接受任意 GeoJSON，所以哪怕 DataV 关站了，你也可以自己找边界数据继续用：
+
+```bash
+# 换数据源：模板里的 {adcode} 会被替换，支持 http(s) 与本地路径
+python3 coros_map.py boundary 110000 -o bj.json \
+    --url-template "https://你的镜像/bound/{adcode}.json"
+
+# 只用单圈边界，不要带下级区县的 _full 版本（体积小、够用）
+python3 coros_map.py boundary 110000 -o bj.json --no-full
+
+# 直接用自己准备的 GeoJSON（任何 FeatureCollection 都行），完全绕开 DataV
+python3 coros_map.py extract --src 华北/Map --region 我的边界.json --out bj
+```
+
+想要权威边界/代码，可以换用民政部「全国行政区划信息查询平台」（`xzqh.mca.gov.cn`）、
+国家统计局的年度区划代码，或全国地理信息资源目录服务系统的 1:100 万基础地理数据；
+DataV 只是工程上最省事的一个（代码和边界一体、按层级可取）。
+
+**关于 adcode**：就是 **GB/T 2260 行政区划代码**，六位 = 省级(2) + 地级(2) + 县级(2)。
+`110000` 北京市、`440300` 深圳市、`810000` 香港、`820000` 澳门。
+DataV 支持按层级逐级取，所以不用背代码——`100000_full.json` 是全国省级，
+`440000_full.json` 是广东各地级市，`440300_full.json` 是深圳各区。
+注意代码会随撤县设区等调整而变化，别抄旧表。
+
 ## 用法
 
 | 命令 | 作用 |
 |---|---|
 | `list` | 列出中国区 v5 区域包、大小、包含省份、App 链接用的 map_id |
 | `download <区域>` | 下载整包，支持断点续传；`--check` 校验条目数/总大小/CRC |
-| `boundary <adcode...>` | 按 adcode 取行政边界并合并成 GeoJSON（源：阿里 DataV） |
+| `boundary <adcode...>` | 按 adcode 取行政边界并合并成 GeoJSON（默认阿里 DataV，可换源） |
 | `tiles <包...>` | 列出包里与边界相交的瓦片（可直接读 zip，无需解压） |
 | `info <文件>` | 查看 PMTiles 头部（zoom 范围、bbox、压缩方式） |
 | `extract --src <包...> --region <geojson>` | 按边界裁剪，输出 `Map/<图层>/<前缀>/<文件名>` |
