@@ -1,0 +1,135 @@
+# coros-map-tools
+
+高驰（COROS）手表离线地图的**下载**与**子区域提取**工具。
+
+官方只提供「整包下载」——华北一整包 1.5 GB、全国 6 GB，而手表存储往往只有几个 GB。
+本工具可以把地图按**任意行政边界**裁剪：例如整个华北包 → 只要北京市，1.5 GB 变 19 MB。
+
+```
+$ python3 coros_map.py list                       # 有哪些区域包
+$ python3 coros_map.py download North-China -o ~/maps --check
+$ python3 coros_map.py boundary 110000 -o beijing.json      # 北京市边界
+$ python3 coros_map.py extract --src ~/maps/Map --region beijing.json --out bj
+   C1321001V00.t  VCM  14.0 MB → 6.6 MB  (47%)
+   S1321001V00.t  VSM  21.1 MB → 12.4 MB (58%)
+   ...
+   合计 4 个文件：55.0 MB → 19.2 MB（压到 34%）
+$ python3 coros_map.py verify --out bj --src ~/maps/Map --region beijing.json
+   合计 168 项：正常 168，裁剪丢失 0，文件缺失 0
+```
+
+> English: a CLI to download COROS watch offline maps and clip them to an arbitrary
+> GeoJSON boundary. The map packages are plain zips of [PMTiles](https://protomaps.com/)
+> archives, so subsetting is done with the official `go-pmtiles` tool. See
+> [技术细节](#技术细节) for the URL layout this relies on.
+
+## 背景：高驰的离线地图是怎么分发的
+
+手表地图有**两种分发方式**，很多人会把它们搞混：
+
+**1. 整包 ZIP（电脑下载 + USB 拷贝）**
+
+```
+http://map-oss-cn.coros.com/map/region/v5/map_<区域>_<ALL|OSM>_v5.zip
+```
+
+- `ALL` = 地貌 + 等高线，`OSM` = 只有地貌（体积约为 ALL 的 1/5）
+- 中国分 8 个区域包（华北 / 华东 / 华南 / 华中 / 东北 / 西南 / 西北 / 全国），见 `list` 子命令
+- 解压后是 `Map/VCM/`（等高线）与 `Map/VSM/`（地貌）两个目录，整个 `Map` 拷到手表根目录
+
+**2. 瓦片包（App 里「复制下载链接」+ 手表 WiFi 下载）**
+
+App 里复制的链接长这样：
+
+```
+https://map-oss-us.coros.com/mapid/WVUZfiZ9.json#mapv5
+```
+
+**这不是地图数据，只是清单**：里面逐条列出瓦片文件名、大小、quadkey。真正的地图数据是
+每个瓦片一个 `.t` 文件（PMTiles 格式），由手表通过 WiFi 从 CDN 逐个拉取。
+清单里的 `files_size` / `count` 与上面 ZIP 包里解压后的大小、文件数**完全对应**。
+
+## 安装
+
+只需要 Python 3.8+（标准库，无第三方依赖）。按边界裁剪时需要官方 pmtiles 工具：
+
+```bash
+go install github.com/protomaps/go-pmtiles@latest
+# 若不在 PATH 里：export COROS_PMTILES=$(go env GOPATH)/bin/go-pmtiles
+```
+
+## 用法
+
+| 命令 | 作用 |
+|---|---|
+| `list` | 列出中国区 v5 区域包、大小、包含省份、App 链接用的 map_id |
+| `download <区域>` | 下载整包，支持断点续传；`--check` 校验条目数/总大小/CRC |
+| `boundary <adcode...>` | 按 adcode 取行政边界并合并成 GeoJSON（源：阿里 DataV） |
+| `tiles <包...>` | 列出包里与边界相交的瓦片（可直接读 zip，无需解压） |
+| `info <文件>` | 查看 PMTiles 头部（zoom 范围、bbox、压缩方式） |
+| `extract --src <包...> --region <geojson>` | 按边界裁剪，输出 `Map/<图层>/<前缀>/<文件名>` |
+| `verify --out <目录> --src <包...>` | 随机抽样比对，确认没裁丢数据 |
+
+几个常用写法：
+
+```bash
+# 多城市并集：先取各自边界，再合并成一个 GeoJSON
+python3 coros_map.py boundary 110000 310000 440300 440100 820000 810000 340100 -o cities.json
+python3 coros_map.py extract --src 华北/Map 华东/Map 华南/Map --region cities.json --out cities
+
+# 只要等高线，不要地貌（省一半以上空间）
+python3 coros_map.py extract --src 华北/Map --region beijing.json --out bj-contour --style VCM
+
+# 丢掉最细一级（z13），体积再小一半左右
+go-pmtiles extract --maxzoom=12 -q 输入.t 输出.t
+
+# 直接按矩形裁切，不要 GeoJSON
+python3 coros_map.py extract --src 华北/Map --bbox 115.42,39.44,117.52,41.07 --out bj
+```
+
+## 技术细节
+
+**`.t` 是标准 [PMTiles v3](https://docs.protomaps.com/pmtiles/) 归档**（MVT 矢量瓦片 + gzip），
+不是私有格式——所以任何 PMTiles 工具都能读它、裁它、甚至渲染成图。
+
+- 每个文件覆盖一个 **level-7 quadkey**，文件名即 `[CS]<quadkey>V00.t`，
+  目录为 `Map/<VCM|VSM>/<quadkey 前三位>/`；`C*` = 等高线，`S*` = 地貌
+- 手表按**当前位置的 quadkey** 去找对应文件，所以**文件名必须保持原样**，
+  把多个城市合并进一个 `.t` 反而会让手表找不到
+- 等高线是 z9–13，地貌是 z8–13
+- 一个 level-7 瓦片 ≈ 240 km × 235 km，所以相距近的城市会共用同一个文件
+  （例如深圳、广州、香港、澳门都在 `1321222` 里）
+
+**各节点的差异（踩过的坑）**
+
+| 节点 | v5 整包 | v3/v4 整包 |
+|---|---|---|
+| `map-oss-cn.coros.com`（国内 OSS） | ✅ 有 | ❌ `/map/region/v4/*.zip` 是 **22 字节的空 zip** |
+| `osm-map.s3.us-west-1.amazonaws.com` | ❌ 403 | ✅ 有 |
+
+官方 PC 下载页的按钮实际指向的是 S3 上那个 v3/v4 包；v5 的整包只在国内 OSS 上。
+
+**关于体积，两条反直觉的经验**
+
+- 华北全区：等高线 1290 MB vs 地貌 263 MB（4.9:1），但**北京一个瓦片是反过来的**
+  （14.0 MB vs 21.1 MB）。原因：等高线体量几乎恒定（各瓦片 2.4–23 MB，极差 10 倍），
+  地貌体量随人类活动密度剧烈波动（0.23–21 MB，**极差 93 倍**，草原/戈壁瓦片里
+  地貌甚至是 0 字节）。而华北包 94% 的瓦片是农村和山区。
+- 裁剪时如果给 `--region` 传了多个**互不相连**的城市，输出文件的头部 bbox 会被写成
+  这些城市的**并集外接框**（例如「西宁到上海」）。本工具默认按瓦片拆分 region
+  （`--no-per-tile-region` 可关），让每个文件的 bbox 如实描述自己——万一固件是按
+  bbox 匹配文件，也不会打开错文件。
+
+## 注意事项
+
+- 输出目录的用法：解压/生成后把**整个 `Map` 目录**合并进手表根目录的 `Map`
+  （同名文件覆盖即可，别删原有的），文件名为 `Map/...` 时目录名不要改；
+  手表上长按返回键 → 工具箱 → 地图设置 → 地图样式，可切换「地貌 / 等高线 / 混合」
+- 裁掉的地方在手表上就是空白，跨出边界就没有地图了；常去的边界区域建议留一点余量
+  （`boundary` 支持一次传多个 adcode，也可以自己往 GeoJSON 里加一个稍大的矩形）
+- 地图数据版权归 COROS 与 OpenStreetMap 贡献者所有。本工具只做格式转换与裁剪，
+  不附带任何地图数据，**请仅用于给自己手表管理离线地图，不要二次分发地图数据**
+
+## License
+
+MIT
