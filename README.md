@@ -18,6 +18,9 @@ $ python3 coros_map.py verify --out bj --src ~/maps/Map --region beijing.json
    合计 168 项：正常 168，裁剪丢失 0，文件缺失 0
 ```
 
+单个城市是最简单的情况。**多个城市会跨区域包**（北京在华北、上海在华东、深圳在华南……），
+完整流程和几个只有多城市才会踩到的坑见 [多个城市](#多个城市会跨区域包)。
+
 > English: a CLI to download COROS watch offline maps and clip them to an arbitrary
 > GeoJSON boundary. The map packages are plain zips of [PMTiles](https://protomaps.com/)
 > archives, so subsetting is done with the official `go-pmtiles` tool. See
@@ -108,10 +111,6 @@ DataV 支持按层级逐级取，所以不用背代码——`100000_full.json` �
 几个常用写法：
 
 ```bash
-# 多城市并集：先取各自边界，再合并成一个 GeoJSON
-python3 coros_map.py boundary 110000 310000 440300 440100 820000 810000 340100 -o cities.json
-python3 coros_map.py extract --src 华北/Map 华东/Map 华南/Map --region cities.json --out cities
-
 # 只要等高线，不要地貌（省一半以上空间）
 python3 coros_map.py extract --src 华北/Map --region beijing.json --out bj-contour --style VCM
 
@@ -121,6 +120,77 @@ go-pmtiles extract --maxzoom=12 -q 输入.t 输出.t
 # 直接按矩形裁切，不要 GeoJSON
 python3 coros_map.py extract --src 华北/Map --bbox 115.42,39.44,117.52,41.07 --out bj
 ```
+
+## 多个城市（会跨区域包）
+
+只做北京很简单，**多个城市才是真正需要留神的地方**：区域包是按省份分组的，
+一个城市属于哪个包得先查，而你想去的几个城市经常分散在好几个包里。
+
+### 1. 先查城市属于哪个区域包
+
+```bash
+$ python3 coros_map.py list --province 安徽
+区域                              地貌+等高线 (ALL)               仅地貌 (OSM)   省份
+East-China                  629.3 MB / 65 文件        299.5 MB / 33 文件   上海、江苏、浙江、安徽、福建、江西、台湾、山东
+```
+
+### 2. 下载涉及的每个包（`--src` 可以给多个）
+
+以「北京 + 上海 + 深圳 + 广州 + 澳门 + 香港 + 合肥」七城为例，它们跨了三个包：
+
+```bash
+# 取边界：一次传多个 adcode，工具会合并成一个 GeoJSON
+python3 coros_map.py boundary 110000 310000 440300 440100 820000 810000 340100 -o cities.json
+
+# 下三个包（北京→华北，上海/合肥→华东，深圳/广州/港澳→华南）
+for r in North-China East-China South-China; do
+  python3 coros_map.py download $r -o ~/maps --check
+done
+
+# 裁剪：--src 直接给 zip，不用解压（也可以给解压后的 Map 目录，或两者混着给）
+python3 coros_map.py extract \
+    --src ~/maps/map_North-China_ALL_v5.zip ~/maps/map_East-China_ALL_v5.zip ~/maps/map_South-China_ALL_v5.zip \
+    --region cities.json --out cities
+
+# 校验：会按城市分组抽样，逐组报告有没有裁丢
+python3 coros_map.py verify --out cities \
+    --src ~/maps/map_North-China_ALL_v5.zip ~/maps/map_East-China_ALL_v5.zip ~/maps/map_South-China_ALL_v5.zip \
+    --region cities.json
+```
+
+实测结果（上面七个城市，地貌 + 等高线）：
+
+```
+三个区域包 2.9 GB → 49.6 MB / 14 个文件（压到 1.7%）
+
+  C1321001V00.t  VCM  14.0 MB →  6.6 MB   北京主体
+  S1321001V00.t  VSM  21.1 MB → 12.4 MB
+  C1303223V00.t  VCM  16.5 MB →  102 KB   北京北部山区（延庆/怀柔/密云北）
+  C1321222V00.t  VCM  18.3 MB →  2.8 MB   深圳 + 广州 + 香港 + 澳门（同一个瓦片）
+  S1321222V00.t  VSM  29.7 MB → 15.1 MB
+  C1321201V00.t  VCM  18.5 MB →  1.2 MB   合肥主体
+  C1321211V00.t  VCM   2.1 MB →  161 KB   上海主体
+  C1303223V00.t  VSM   3.4 MB →   26 KB
+  ...
+
+七个城市各抽 10 个境内点 × 2 图层 = 140 项，零丢失
+只要等高线（--style VCM）则 11.5 MB
+```
+
+### 3. 多城市才会遇到的几个坑
+
+- **相邻城市可能共用同一个瓦片，拆不开。** 瓦片按 level-7 quadkey 切，每块约 240×235 km，
+  整个珠三角（深圳/广州/香港/澳门）都在 `1321222` 里，所以「只留深圳」做不到，
+  会连广州、香港、澳门一起带上；北京则横跨 `1321001` + `1303223` 两块。
+  `tiles` 子命令可以先看清楚边界落在哪些瓦片：
+  `python3 coros_map.py tiles ~/maps/map_South-China_ALL_v5.zip --region cities.json`
+- **多个包之间有重复瓦片，不用管。** 跨区域边界上的瓦片会在相邻两个包里各存一份
+  （内容相同，md5 一致），工具按 `(图层, quadkey)` 自动去重。
+- **不要只下一个包。** 想去的城市跨包是常态，`list --province <省>` 用来反查省份
+  在哪个包，但一个包只覆盖它列出的那些省份。
+- **边界别裁太紧。** 裁掉的地方在手表上就是空白。经常在城际之间跑的话，
+  把相邻城市的 adcode 也一起传进去（比如跑步常去燕郊就带上廊坊 `131000`），
+  或者自己准备一个比行政边界稍大一圈的 GeoJSON 丢给 `--region`。
 
 ## 技术细节
 

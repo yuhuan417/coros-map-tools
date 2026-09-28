@@ -221,6 +221,9 @@ def read_pmtiles_header(path_or_obj):
         return parse_pmtiles_header(f.read(PMTILES_HEADER_LEN))
 
 
+_zip_cache = {}          # zip 路径 → ZipFile，避免惰性 opener 用到已关闭的归档
+
+
 def iter_package_tiles(src, styles=("VCM", "VSM")):
     """遍历一个地图包，产出 (style, 文件名, quadkey, 大小, 头部信息, 打开函数)
 
@@ -236,18 +239,20 @@ def iter_package_tiles(src, styles=("VCM", "VSM")):
         return (style, name, qk, size, info, opener)
 
     if zipfile.is_zipfile(src):
-        with zipfile.ZipFile(src) as zf:
-            for zi in zf.infolist():
-                parts = zi.filename.split("/")
-                if len(parts) < 2 or not zi.filename.endswith(".t"):
-                    continue
-                style = parts[-3] if len(parts) >= 3 else parts[0]
-                name = parts[-1]
-                if style not in styles:
-                    continue
-                item = emit(style, name, zi.file_size, lambda zi=zi, zf=zf: zf.open(zi))
-                if item:
-                    yield item
+        # zip 句柄要活到 opener 被调用时（调用可能发生在遍历结束之后），所以缓存住不关闭；
+        # 进程退出时由 GC 收尾
+        zf = _zip_cache.setdefault(os.path.abspath(src), zipfile.ZipFile(src))
+        for zi in zf.infolist():
+            parts = zi.filename.split("/")
+            if len(parts) < 2 or not zi.filename.endswith(".t"):
+                continue
+            style = parts[-3] if len(parts) >= 3 else parts[0]
+            name = parts[-1]
+            if style not in styles:
+                continue
+            item = emit(style, name, zi.file_size, lambda zi=zi, zf=zf: zf.open(zi))
+            if item:
+                yield item
         return
 
     for style in styles:
